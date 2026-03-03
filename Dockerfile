@@ -2,13 +2,15 @@ FROM python:3.11-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
     tesseract-ocr \
     tesseract-ocr-por \
     libmagic1 \
     poppler-utils \
-    unrar-free \
+    unrar \
     p7zip-full \
-    libreoffice-headless \
+    libreoffice \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
