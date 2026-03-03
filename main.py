@@ -7,9 +7,11 @@ import asyncio
 import io
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 from pathlib import Path
@@ -24,9 +26,16 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+PARSER_MODE = os.getenv("PARSER_MODE", "balanced").strip().lower()
 ENABLE_EASYOCR = os.getenv("ENABLE_EASYOCR", "false").lower() == "true"
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_first" else "2"))
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
+
+# Precision-first knobs (safe defaults for quality)
+FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
+REPROCESS_IF_SCORE_BELOW = float(os.getenv("REPROCESS_IF_SCORE_BELOW", "0.72" if PARSER_MODE == "precision_first" else "0.55"))
+MIN_CHARS_PER_PAGE_NATIVE = int(os.getenv("MIN_CHARS_PER_PAGE_NATIVE", "180" if PARSER_MODE == "precision_first" else "80"))
+CLEAN_OCR_NOISE = os.getenv("CLEAN_OCR_NOISE", "true").lower() == "true"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("parser-monstro")
@@ -48,6 +57,7 @@ class DocumentInput(BaseModel):
 
 class ParseOptions(BaseModel):
     enable_easyocr: bool = False
+    force_ocr: bool = False
 
 
 class ParseRequest(BaseModel):
@@ -87,7 +97,14 @@ async def startup():
     global semaphore
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
-    logger.info("Parser Monstro iniciado. MAX_WORKERS=%d EASYOCR=%s", MAX_WORKERS, ENABLE_EASYOCR)
+    logger.info(
+        "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
+        PARSER_MODE,
+        MAX_WORKERS,
+        ENABLE_EASYOCR,
+        FORCE_OCR_IF_SCORE_BELOW,
+        REPROCESS_IF_SCORE_BELOW,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +118,14 @@ def health():
         tess_ok = True
     except Exception:
         tess_ok = False
-    return {"status": "ok", "tesseract": tess_ok, "easyocr_enabled": ENABLE_EASYOCR}
+    return {
+        "status": "ok",
+        "tesseract": tess_ok,
+        "easyocr_enabled": ENABLE_EASYOCR,
+        "parser_mode": PARSER_MODE,
+        "force_ocr_if_score_below": FORCE_OCR_IF_SCORE_BELOW,
+        "reprocess_if_score_below": REPROCESS_IF_SCORE_BELOW,
+    }
 
 
 @app.get("/queue")
@@ -153,12 +177,13 @@ async def _process_job(job_id: str, req: ParseRequest):
         doc_results: List[Dict] = []
         errors: List[str] = []
         use_easyocr = (req.options and req.options.enable_easyocr) or ENABLE_EASYOCR
+        force_ocr = bool(req.options and req.options.force_ocr)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             for doc in req.documents:
                 try:
-                    results = await _handle_document(doc, tmp, use_easyocr)
+                    results = await _handle_document(doc, tmp, use_easyocr, force_ocr)
                     doc_results.extend(results)
                 except Exception as exc:
                     logger.exception("Erro ao processar %s", doc.filename)
@@ -175,7 +200,7 @@ async def _process_job(job_id: str, req: ParseRequest):
         logger.info("Job %s concluído em %.1fs (%d docs)", job_id, jobs[job_id]["processing_time_s"], len(doc_results))
 
 
-async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool) -> List[Dict]:
+async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool) -> List[Dict]:
     """Download + decompress + parse one document. Returns list of DocumentResult dicts."""
     # Download
     dest = tmpdir / doc.filename
@@ -201,7 +226,7 @@ async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool) 
 
     results = []
     for fpath in files_to_parse:
-        result = _parse_file(fpath, use_easyocr)
+        result = _parse_file(fpath, use_easyocr, force_ocr)
         results.append(result)
     return results
 
@@ -232,14 +257,14 @@ def _extract_7z(path: Path, dest: Path) -> List[Path]:
     return [p for p in out.rglob("*") if p.is_file()]
 
 
-def _parse_file(path: Path, use_easyocr: bool) -> Dict:
+def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     """Parse a single file with fallback chain."""
     mime = magic.from_file(str(path), mime=True)
     filename = path.name
 
     # Route by type
     if "pdf" in mime:
-        return _parse_pdf(path, use_easyocr)
+        return _parse_pdf(path, use_easyocr, force_ocr)
     elif "word" in mime or "officedocument" in mime or path.suffix.lower() in (".doc", ".docx"):
         return _parse_docx(path)
     elif "html" in mime or path.suffix.lower() in (".html", ".htm"):
@@ -253,28 +278,25 @@ def _parse_file(path: Path, use_easyocr: bool) -> Dict:
         return _make_result(filename, mime, "unsupported", 0, 0.0, "", error=f"Tipo não suportado: {mime}")
 
 
-def _parse_pdf(path: Path, use_easyocr: bool) -> Dict:
+def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
     filename = path.name
     text = ""
     method = ""
     pages = 0
 
-    # 1. pdfplumber
+    # 1) pdfplumber (preferência para texto nativo)
     try:
         import pdfplumber
         with pdfplumber.open(str(path)) as pdf:
             pages = len(pdf.pages)
-            parts = []
-            for pg in pdf.pages:
-                t = pg.extract_text() or ""
-                parts.append(t)
+            parts = [(pg.extract_text() or "") for pg in pdf.pages]
             text = "\n".join(parts).strip()
             if text:
                 method = "pdfplumber"
     except Exception as e:
         logger.debug("pdfplumber falhou em %s: %s", filename, e)
 
-    # 2. pymupdf
+    # 2) pymupdf fallback para texto nativo ruim/incompleto
     if not text:
         try:
             import fitz  # pymupdf
@@ -288,16 +310,28 @@ def _parse_pdf(path: Path, use_easyocr: bool) -> Dict:
         except Exception as e:
             logger.debug("pymupdf falhou em %s: %s", filename, e)
 
-    # 3. tesseract OCR (render each page as image)
-    if not text:
+    text = _normalize_text(text)
+    quality = _quality_score(text, pages)
+
+    chars_per_page = (len(text) / max(1, pages)) if text else 0
+    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW or chars_per_page < MIN_CHARS_PER_PAGE_NATIVE
+
+    # 3) OCR obrigatório quando forçado ou quando extração nativa é fraca
+    if force_ocr or not text or native_is_weak:
         try:
-            text, pages_ocr = _pdf_ocr_tesseract(path, use_easyocr)
-            pages = pages_ocr or pages
-            method = "tesseract" if text else "failed"
+            ocr_text, pages_ocr = _pdf_ocr_tesseract(path, use_easyocr)
+            ocr_text = _normalize_text(ocr_text)
+            ocr_pages = pages_ocr or pages
+            ocr_quality = _quality_score(ocr_text, ocr_pages)
+
+            if force_ocr or ocr_quality >= quality or quality < REPROCESS_IF_SCORE_BELOW:
+                text = ocr_text
+                pages = ocr_pages
+                quality = ocr_quality
+                method = "easyocr" if use_easyocr else "tesseract"
         except Exception as e:
             logger.debug("tesseract OCR falhou em %s: %s", filename, e)
 
-    quality = _quality_score(text, pages)
     type_detected = "pdf_native" if method in ("pdfplumber", "pymupdf") else "pdf_scanned"
     return _make_result(filename, type_detected, method or "failed", pages, quality, text)
 
@@ -384,6 +418,31 @@ def _parse_image_ocr(path: Path, use_easyocr: bool) -> Dict:
         return _make_result(filename, "image", "failed", 0, 0.0, "", error=str(e))
 
 
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    txt = unicodedata.normalize("NFKC", text)
+    txt = txt.replace("\x00", " ")
+
+    if CLEAN_OCR_NOISE:
+        # remove linhas com ruído típico de OCR (quase sem vogais e muito símbolo)
+        cleaned_lines = []
+        for line in txt.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            non_word_ratio = len(re.findall(r"[^\w\s]", s)) / max(1, len(s))
+            vowels = len(re.findall(r"[aeiouáéíóúâêôãõàü]", s, flags=re.IGNORECASE))
+            if len(s) >= 24 and vowels == 0 and non_word_ratio > 0.25:
+                continue
+            cleaned_lines.append(s)
+        txt = "\n".join(cleaned_lines)
+
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
 def _quality_score(text: str, pages: int) -> float:
     if not text or not pages:
         return 0.0
@@ -395,12 +454,14 @@ def _quality_score(text: str, pages: int) -> float:
 
 
 def _make_result(filename, type_detected, method, pages, quality, text, error=None) -> Dict:
+    normalized_text = _normalize_text(text)
+    quality = _quality_score(normalized_text, pages)
     return {
         "filename": filename,
         "type_detected": type_detected,
         "method_used": method,
         "pages": pages,
         "quality_score": quality,
-        "text": text,
+        "text": normalized_text,
         "error": error,
     }
