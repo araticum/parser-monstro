@@ -69,6 +69,12 @@ class ParseRequest(BaseModel):
     options: Optional[ParseOptions] = None
 
 
+class DownloadRequest(BaseModel):
+    tender_id: str
+    documents: List[DocumentInput]
+    monstro_callback_url: str
+
+
 class DocumentResult(BaseModel):
     filename: str
     type_detected: str
@@ -240,6 +246,64 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
         status="pending",
         job_id=job_id,
     )
+
+
+@app.post("/download")
+async def download_documents(req: DownloadRequest):
+    tender_root = STORAGE_ROOT / req.tender_id
+    raw_dir = tender_root / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    files_sent = 0
+    errors: List[str] = []
+
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        for doc in req.documents:
+            url = (doc.url or "").strip()
+            filename = Path(doc.filename or "documento").name or "documento"
+            if not url:
+                errors.append(f"Documento sem URL: {filename}")
+                continue
+
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                content = resp.content
+            except Exception as exc:
+                errors.append(f"Falha ao baixar {filename} ({url}): {exc}")
+                continue
+
+            raw_path = raw_dir / filename
+            try:
+                raw_path.write_bytes(content)
+            except Exception as exc:
+                errors.append(f"Falha ao salvar raw {filename}: {exc}")
+                continue
+
+            files_to_send: List[Path] = []
+            if content[:2] == b"PK":
+                try:
+                    extracted = _extract_zip(raw_path, raw_dir)
+                    files_to_send = [p for p in extracted if p.is_file()]
+                except Exception as exc:
+                    errors.append(f"Falha ao extrair ZIP {filename}: {exc}")
+                    continue
+            else:
+                files_to_send = [raw_path]
+
+            for fpath in files_to_send:
+                try:
+                    file_bytes = fpath.read_bytes()
+                    cb_resp = await client.post(
+                        req.monstro_callback_url,
+                        files={"file": (fpath.name, file_bytes, "application/octet-stream")},
+                    )
+                    cb_resp.raise_for_status()
+                    files_sent += 1
+                except Exception as exc:
+                    errors.append(f"Falha callback {fpath.name}: {exc}")
+
+    return {"status": "ok", "files_sent": files_sent, "errors": errors}
 
 
 # ---------------------------------------------------------------------------
