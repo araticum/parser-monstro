@@ -4,16 +4,15 @@ API REST FastAPI — roda em container isolado na porta 7000.
 """
 
 import asyncio
-import io
+import json
 import logging
 import os
 import re
-import shutil
-import tempfile
 import time
 import unicodedata
 import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +44,9 @@ logger = logging.getLogger("parser-monstro")
 # ---------------------------------------------------------------------------
 jobs: Dict[str, Dict[str, Any]] = {}
 semaphore: asyncio.Semaphore  # initialised in lifespan
+purge_tasks: Dict[str, asyncio.Task] = {}
+purge_index_path = STORAGE_ROOT / ".purge_index.json"
+purge_index_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,7 @@ class ParseOptions(BaseModel):
 class ParseRequest(BaseModel):
     tender_id: str
     documents: List[DocumentInput]
+    purge_after_days: int = 7
     options: Optional[ParseOptions] = None
 
 
@@ -97,6 +100,7 @@ async def startup():
     global semaphore
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    await _restore_and_schedule_purges()
     logger.info(
         "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
         PARSER_MODE,
@@ -143,12 +147,36 @@ def get_job(job_id: str):
     return jobs[job_id]
 
 
+@app.get("/storage/{tender_id}")
+def list_storage(tender_id: str):
+    target_dir = STORAGE_ROOT / tender_id
+    if not target_dir.exists() or not target_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Storage not found for tender")
+    files = [str(p.relative_to(target_dir)) for p in target_dir.rglob("*") if p.is_file()]
+    return {
+        "tender_id": tender_id,
+        "storage_path": str(target_dir),
+        "files": sorted(files),
+        "count": len(files),
+    }
+
+
+@app.delete("/storage/{tender_id}")
+async def delete_storage(tender_id: str):
+    deleted = await _purge_tender_storage(tender_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Storage not found for tender")
+    return {"tender_id": tender_id, "deleted": True}
+
+
 # ---------------------------------------------------------------------------
 # Main parse endpoint
 # ---------------------------------------------------------------------------
 @app.post("/parse", response_model=ParseResponse, status_code=202)
 async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
+    purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
+    storage_path = STORAGE_ROOT / req.tender_id
     jobs[job_id] = {
         "job_id": job_id,
         "tender_id": req.tender_id,
@@ -158,6 +186,8 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
         "errors": [],
         "processing_time_s": 0.0,
         "created_at": time.time(),
+        "storage_path": str(storage_path),
+        "purge_at": purge_at.isoformat(),
     }
     background_tasks.add_task(_process_job, job_id, req)
     return ParseResponse(
@@ -178,33 +208,39 @@ async def _process_job(job_id: str, req: ParseRequest):
         errors: List[str] = []
         use_easyocr = (req.options and req.options.enable_easyocr) or ENABLE_EASYOCR
         force_ocr = bool(req.options and req.options.force_ocr)
+        target_dir = STORAGE_ROOT / req.tender_id
+        target_dir.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            for doc in req.documents:
-                try:
-                    results = await _handle_document(doc, tmp, use_easyocr, force_ocr)
-                    doc_results.extend(results)
-                except Exception as exc:
-                    logger.exception("Erro ao processar %s", doc.filename)
-                    errors.append(f"{doc.filename}: {exc}")
+        for doc in req.documents:
+            try:
+                results = await _handle_document(doc, target_dir, use_easyocr, force_ocr)
+                doc_results.extend(results)
+            except Exception as exc:
+                logger.exception("Erro ao processar %s", doc.filename)
+                errors.append(f"{doc.filename}: {exc}")
 
         full_text = "\n\n".join(r["text"] for r in doc_results if r.get("text"))
         jobs[job_id].update(
-            status="done" if not errors or doc_results else "error",
+            status="done" if doc_results else "error",
             documents=doc_results,
             full_text=full_text,
             errors=errors,
             processing_time_s=round(time.time() - t0, 2),
+            storage_path=str(target_dir),
         )
+
+        purge_at = datetime.now(timezone.utc) + timedelta(days=max(1, req.purge_after_days))
+        jobs[job_id]["purge_at"] = purge_at.isoformat()
+        await _upsert_purge_schedule(req.tender_id, purge_at)
+
         logger.info("Job %s concluído em %.1fs (%d docs)", job_id, jobs[job_id]["processing_time_s"], len(doc_results))
 
 
 async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool) -> List[Dict]:
     """Download + decompress + parse one document. Returns list of DocumentResult dicts."""
-    # Download
-    dest = tmpdir / doc.filename
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+    safe_name = Path(doc.filename).name or f"doc_{uuid.uuid4().hex}"
+    dest = tmpdir / safe_name
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(doc.url)
         resp.raise_for_status()
     dest.write_bytes(resp.content)
@@ -255,6 +291,89 @@ def _extract_7z(path: Path, dest: Path) -> List[Path]:
     with py7zr.SevenZipFile(str(path), mode="r") as zf:
         zf.extractall(path=str(out))
     return [p for p in out.rglob("*") if p.is_file()]
+
+
+async def _restore_and_schedule_purges() -> None:
+    if not purge_index_path.exists():
+        return
+    try:
+        raw = json.loads(purge_index_path.read_text())
+    except Exception:
+        logger.warning("Falha ao ler índice de purge; ignorando")
+        return
+
+    now = datetime.now(timezone.utc)
+    changed = False
+    for tender_id, purge_at_iso in raw.items():
+        try:
+            purge_at = datetime.fromisoformat(purge_at_iso)
+            if purge_at.tzinfo is None:
+                purge_at = purge_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            changed = True
+            continue
+
+        if purge_at <= now:
+            await _purge_tender_storage(tender_id)
+            changed = True
+            continue
+        _schedule_purge_task(tender_id, purge_at)
+
+    if changed:
+        await _save_purge_index(await _load_purge_index())
+
+
+async def _load_purge_index() -> Dict[str, str]:
+    async with purge_index_lock:
+        if not purge_index_path.exists():
+            return {}
+        try:
+            return json.loads(purge_index_path.read_text())
+        except Exception:
+            return {}
+
+
+async def _save_purge_index(data: Dict[str, str]) -> None:
+    async with purge_index_lock:
+        purge_index_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _schedule_purge_task(tender_id: str, purge_at: datetime) -> None:
+    existing = purge_tasks.get(tender_id)
+    if existing and not existing.done():
+        existing.cancel()
+    purge_tasks[tender_id] = asyncio.create_task(_purge_after_delay(tender_id, purge_at))
+
+
+async def _upsert_purge_schedule(tender_id: str, purge_at: datetime) -> None:
+    data = await _load_purge_index()
+    data[tender_id] = purge_at.isoformat()
+    await _save_purge_index(data)
+    _schedule_purge_task(tender_id, purge_at)
+
+
+async def _purge_after_delay(tender_id: str, purge_at: datetime) -> None:
+    delay = max(0, (purge_at - datetime.now(timezone.utc)).total_seconds())
+    await asyncio.sleep(delay)
+    await _purge_tender_storage(tender_id)
+
+
+async def _purge_tender_storage(tender_id: str) -> bool:
+    target_dir = STORAGE_ROOT / tender_id
+    existed = target_dir.exists() and target_dir.is_dir()
+    if existed:
+        import shutil
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+    data = await _load_purge_index()
+    if tender_id in data:
+        data.pop(tender_id, None)
+        await _save_purge_index(data)
+
+    task = purge_tasks.pop(tender_id, None)
+    if task and not task.done():
+        task.cancel()
+    return existed
 
 
 def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
