@@ -343,6 +343,14 @@ async def _process_job(job_id: str, req: ParseRequest):
                 errors.append(f"{doc.filename}: {exc}")
 
         full_text = "\n\n".join(r["text"] for r in doc_results if r.get("text"))
+        # Persistir textos parseados em disco
+        parsed_dir = target_dir / "parsed"
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+        if full_text:
+            (parsed_dir / "full_text.txt").write_text(full_text, encoding="utf-8")
+        for r in doc_results:
+            if r.get("text") and r.get("filename"):
+                (parsed_dir / (r["filename"] + ".txt")).write_text(r["text"], encoding="utf-8")
         jobs[job_id].update(
             status="done" if doc_results else "error",
             documents=doc_results,
