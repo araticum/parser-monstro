@@ -36,6 +36,7 @@ RUN if [ "$ENABLE_EASYOCR" = "true" ]; then \
     fi
 
 COPY main.py .
+COPY zip_recursive.py .
 
 RUN mkdir -p /app/storage
 
